@@ -1,0 +1,29 @@
+# Binaries
+/bin/
+/build/
+/dist/
+*.exe
+*.test
+
+# Go cache
+/tmp/
+*.test.exe
+
+# Env
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+redis-data/
+rabbitmq-data/
+*.log
+redis_info.txt
