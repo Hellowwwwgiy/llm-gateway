@@ -45,8 +45,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      # rabbitmq 是可选的 — 默认用 Redis List 当 MQ（lpush/brpop）
+      # 要启用 RabbitMQ，取消下面两行的注释 + gateway 环境变量 RABBITMQ_URL
+      # rabbitmq:
+      #   condition: service_healthy
     restart: unless-stopped
 
   dispatcher:
@@ -59,8 +61,6 @@ services:
       - .env
     depends_on:
       redis:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
     restart: unless-stopped
 

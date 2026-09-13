@@ -1,39 +1,46 @@
 # SmartProxy — 多模型 LLM API 网关
 
-> 一个统一接入多家大模型（OpenAI / 通义 / 豆包）的 API 网关，用户调你一个接口，你负责 **路由、限流、缓存、熔断、异步批处理、用量统计**。
+> 统一 LLM API 网关（Go + Gin + Redis），用户调一个接口，后端负责 **JWT 鉴权、Redis Lua 限流、Prompt MD5 缓存、三态熔断、异步 LPUSH/BRPOP 队列、Prometheus 可观测**。当前已接入 DeepSeek，架构支持一行代码扩展通义/豆包。
 
 ---
 
 ## 🏗️ 架构图
 
 ```
-                    ┌─────────────────────┐
-  用户请求 ──────►  │    🚪 API 网关服务    │  ← 统一入口 / 鉴权 / 路由 / SSE
-                    └─────────┬───────────┘
-                              │
-                 ┌────────────┼────────────┐
-                 ▼            ▼            ▼
-          ┌──────────┐  ┌──────────┐  ┌──────────┐
-          │ ⚡ 限流服务 │  │ 💾 缓存服务 │  │ 📊 统计服务 │
-          │(Redis Lua)│  │(Prompt去重)│  │(Pipeline) │
-          └──────────┘  └──────────┘  └──────────┘
-                 │            │            │
-                 └────────────┼────────────┘
-                              ▼
-                    ┌─────────────────────┐
-                    │  📨 Redis 消息队列     │  ← LPUSH/BRPOP  + 死信 List
-                    └─────────┬───────────┘
-                              ▼
-                    ┌─────────────────────┐
-                    │  🔧 异步调度消费者     │  ← Worker Pool + 熔断 + 重试
-                    └─────────┬───────────┘
-                              ▼
-                    ┌─────────────────────┐
-                    │  🌐 LLM Provider x N  │  ← OpenAI / 通义 / 豆包 ...
-                    └─────────────────────┘
+                    ┌─────────────────────────────┐
+  用户请求 ──────►  │  🚪 Gateway :8080 (Gin)      │
+                    │  ┌─────────────────────────┐ │
+                    │  │ JWT → Router → 限流     │ │
+                    │  │              → 缓存     │ │
+                    │  │              → 熔断     │ │
+                    │  │              → LLM 调用 │ │
+                    │  └────────────┬────────────┘ │
+                    │               │              │
+                    │  (异步: LPUSH)│              │
+                    └──────────────┼──────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+             ┌──────────┐  ┌──────────┐  ┌──────────┐
+             │  Redis   │  │  Redis   │  │  Redis   │
+             │ Lua 限流  │  │ MD5 缓存 │  │ List 队列 │
+             └──────────┘  └──────────┘  └────┬─────┘
+                                               │ BRPOP
+                                               ▼
+                                        ┌──────────────┐
+                                        │ 🔧 Dispatcher │
+                                        │  :8081 8worker│
+                                        │  +熔断 +重试  │
+                                        └──────┬───────┘
+                                               │
+                                               ▼
+                                        ┌──────────────┐
+                                        │  LLM Provider │
+                                        │  (DeepSeek)   │
+                                        └──────────────┘
 ```
 
-## 🔗 核心链路（面试必考）
+## 🔗 核心链路
 
 ```
 POST /api/v1/chat/completions
@@ -62,7 +69,7 @@ POST /api/v1/chat/completions
 | 鉴权 | **JWT (golang-jwt/jwt/v5)** | 无状态、适合分布式 |
 | 限流 | **Redis Lua 令牌桶** | 原子性脚本、分布式安全 |
 | 熔断重试 | **自研 resilience 包** | 三态状态机 + 指数退避 |
-| 可观测 | **手写 Prometheus 指标** | 16 个指标含 Histogram bucket |
+| 可观测 | **手写 Prometheus 指标** | 14 个指标含 Histogram bucket（Gateway + Dispatcher 双端口） |
 | 容器 | **Docker Compose** | 一键拉起全链路 |
 | 构建 | **-trimpath -ldflags="-s -w"** | 防路径泄露、体积 -30%、减少杀毒误报 |
 
@@ -97,7 +104,7 @@ smartproxy/
 │   ├── build.sh                 # Linux / macOS 构建
 │   ├── run-gw.bat               # Windows 快速启动 gateway
 │   ├── mock_llm.py              # 本地 mock LLM（非流式 + SSE）
-│   └── test_sse.py              # SSE 端到端测试
+│   └── test_full.py             # 端到端测试脚本
 ├── go.mod / go.sum
 ├── docker-compose.yml           # Redis + Gateway + Dispatcher (RabbitMQ 可选)
 ├── Dockerfile                   # 多阶段构建
@@ -138,7 +145,7 @@ Gateway 启动后提示：
 
 # 2. 配置真实 DeepSeek
 copy .env.example .env
-# .env 里已经配好 DeepSeek Key，gateway 自动读
+# .env.example 是模板，填你自己的 DeepSeek API Key
 
 # 3. 启动 gateway + dispatcher
 scripts\build.bat all
@@ -178,12 +185,12 @@ $token = $resp.token
 # 2. 同步调用
 Invoke-RestMethod -Method POST -Uri http://localhost:8080/api/v1/chat/completions `
     -Headers @{Authorization="Bearer $token"; "Content-Type"="application/json"} `
-    -Body '{"model":"mock-gpt","messages":[{"role":"user","content":"hi"}]}'
+    -Body '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
 
 # 3. 异步调用 + 轮询
 $async = Invoke-RestMethod -Method POST -Uri http://localhost:8080/api/v1/chat/completions/async `
     -Headers @{Authorization="Bearer $token"; "Content-Type"="application/json"} `
-    -Body '{"model":"mock-gpt","messages":[{"role":"user","content":"hi"}]}'
+    -Body '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
 
 Start-Sleep -Seconds 2
 Invoke-RestMethod -Uri "http://localhost:8080/api/v1/chat/completions/result/$($async.request_id)" `
@@ -207,7 +214,7 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/v1/chat/completions/result/$($
 10/10 PASS
 ```
 
-## 📊 Prometheus 指标（16 个）
+## 📊 Prometheus 指标（14 个）
 
 | 分类 | 指标 | 类型 |
 |------|------|------|
