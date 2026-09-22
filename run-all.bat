@@ -180,12 +180,15 @@ echo   status: run-all.bat status
 echo   logs:   type .run\gateway.log
 echo.
 
-echo [STEP] Opening frontend page...
-REM Random query param bypasses browser HTTP cache
+echo [STEP] Opening browser tabs...
+REM Random query params bypass browser HTTP cache
 set "NOW=!RANDOM!!RANDOM!"
 start "" "http://localhost:!GW_PORT!/?t=!NOW!"
-echo [OK] Frontend opened (metrics embedded in page)
-echo.
+timeout /t 1 /nobreak >nul
+start "" "http://localhost:!GW_PORT!/metrics?t=!NOW!"
+timeout /t 1 /nobreak >nul
+start "" "http://localhost:!DP_PORT!/metrics?t=!NOW!"
+echo [OK] Opened: 1 frontend + 2 raw metrics (Prometheus format)
 exit /b 0
 
 REM ==================================================================
