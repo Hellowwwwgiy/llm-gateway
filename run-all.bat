@@ -182,6 +182,12 @@ echo.
 
 echo [OK] All services up.
 echo.
+
+echo [STEP] Opening frontend...
+set "NOW=!RANDOM!!RANDOM!"
+start "" "http://localhost:!GW_PORT!/?t=!NOW!"
+echo [OK] Done.
+
 exit /b 0
 
 REM ==================================================================
