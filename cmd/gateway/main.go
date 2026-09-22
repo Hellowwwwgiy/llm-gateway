@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -115,6 +116,7 @@ func main() {
 	r.GET("/", app.index)
 	r.GET("/healthz", app.healthz)
 	r.GET("/metrics", wrapHandler(metrics.Handler()))
+	r.GET("/api/v1/metrics/dispatcher", app.dispatcherMetricsProxy)
 
 	r.POST("/api/v1/login", app.login)
 
@@ -223,7 +225,19 @@ func (a *App) index(c *gin.Context) {
 
 	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	c.Header("Pragma", "no-cache")
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(indexHTML(redisStatus, mqStatus, providers, models)))
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(indexHTML(redisStatus, mqStatus, providers, models, a.cfg.DispatcherPort)))
+}
+
+func (a *App) dispatcherMetricsProxy(c *gin.Context) {
+	target := fmt.Sprintf("http://127.0.0.1:%d/metrics", a.cfg.DispatcherPort)
+	r, err := http.Get(target)
+	if err != nil {
+		c.String(http.StatusBadGateway, "dispatcher unreachable: %v", err)
+		return
+	}
+	defer r.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+	c.Data(r.StatusCode, "text/plain; charset=utf-8", body)
 }
 
 func (a *App) login(c *gin.Context) {
@@ -491,7 +505,7 @@ func (a *App) dailyStats(c *gin.Context) {
 
 // ====== 首页 ======
 
-func indexHTML(redisStatus, mqStatus string, providers, models []string) string {
+func indexHTML(redisStatus, mqStatus string, providers, models []string, dispatcherPort int) string {
 	providerList := ""
 	for _, p := range providers {
 		providerList += "<span class='tag'>" + p + "</span> "
@@ -552,6 +566,18 @@ func indexHTML(redisStatus, mqStatus string, providers, models []string) string 
   .resp{margin-top:1rem;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:1rem;min-height:60px;white-space:pre-wrap;font-family:'Consolas',monospace;font-size:.85rem;max-height:300px;overflow-y:auto}
   .resp.err{border-color:#ef4444;color:#fca5a5}
   .resp.ok{border-color:#22c55e}
+  /* Live Metrics */
+  .metrics-section{margin-top:2rem}
+  .metrics-section h2{font-size:1.1rem;margin-bottom:1rem}
+  .metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem}
+  .metric{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:.8rem 1rem;font-size:.85rem}
+  .metric .m-name{color:#94a3b8;font-family:'Consolas',monospace;font-size:.72rem;text-transform:none;letter-spacing:0}
+  .metric .m-val{font-size:1.4rem;font-weight:700;color:#60a5fa;margin-top:.15rem}
+  .metric .m-src{font-size:.65rem;color:#64748b;margin-top:.25rem;text-transform:uppercase}
+  .metric[data-src="dispatcher"] .m-val{color:#f472b6}
+  .metric[data-src="dispatcher"] .m-name{color:#9d7fbf}
+  .refresh-hint{font-size:.72rem;color:#64748b;margin-top:.25rem}
+  .badge{display:inline-block;background:#334155;color:#cbd5e1;padding:.1rem .5rem;border-radius:4px;font-size:.7rem;margin-left:.5rem}
 </style>
 </head>
 <body>
@@ -582,6 +608,12 @@ func indexHTML(redisStatus, mqStatus string, providers, models []string) string 
       <button id="btnStream" onclick="sendStream()">Stream</button>
     </div>
     <div id="resp" class="resp">Response will appear here...</div>
+  </div>
+
+  <div class="metrics-section">
+    <h2>📊 Live Metrics <span id="metricsBadge" class="badge">refreshing...</span></h2>
+    <div class="metrics-grid" id="metricsGrid"></div>
+    <div class="refresh-hint">Auto-refresh every 3s · Gateway /metrics + Dispatcher /metrics (proxied here)</div>
   </div>
 </div>
 
@@ -641,6 +673,59 @@ async function sendStream(){
   }catch(e){resp.className='resp err'; resp.textContent='Error: '+e.message;}
   btn.disabled=false; btn.textContent='Stream';
 }
+
+// ===== Live Metrics =====
+function parseMetrics(text){
+  const result = {};
+  for(const line of text.split('\n')){
+    if(!line || line.startsWith('#')) continue;
+    const sp = line.indexOf(' '); if(sp<0) continue;
+    const nameAndLabel = line.slice(0, sp);
+    const val = line.slice(sp+1).trim();
+    // Skip _bucket / _sum / _count variants unless no plain key
+    if(nameAndLabel.includes('_bucket')||nameAndLabel.includes('_sum')||nameAndLabel.includes('_count')) continue;
+    const name = nameAndLabel.split('{')[0];
+    if(!result[name]) result[name] = val;
+  }
+  return result;
+}
+async function refreshMetrics(){
+  const grid = document.getElementById('metricsGrid');
+  const badge = document.getElementById('metricsBadge');
+  let gw = {}, dp = {};
+  try{
+    const [r1, r2] = await Promise.all([
+      fetch('/metrics?t='+Date.now()).catch(()=>null),
+      fetch('/api/v1/metrics/dispatcher?t='+Date.now()).catch(()=>null),
+    ]);
+    if(r1?.ok) gw = parseMetrics(await r1.text());
+    if(r2?.ok) dp = parseMetrics(await r2.text());
+    badge.textContent = 'updated ' + new Date().toLocaleTimeString();
+  }catch(e){ badge.textContent = 'offline'; }
+  const items = [
+    ['http_requests_total','HTTP reqs','GW'],
+    ['http_request_errors_total','HTTP errors','GW'],
+    ['cache_hits_total','Cache hits','GW'],
+    ['cache_misses_total','Cache misses','GW'],
+    ['ratelimit_rejects_total','Rate-limit rej','GW'],
+    ['provider_calls_total','LLM calls','GW'],
+    ['provider_failures_total','LLM failures','GW'],
+    ['mq_publish_total','MQ publishes','GW'],
+    ['mq_consume_total','MQ consumed','DP'],
+    ['mq_consume_failures_total','MQ fail','DP'],
+    ['circuit_breaker_open_total','CB opened','BOTH'],
+  ];
+  const html = items.map(([name,label,src])=>{
+    let v, cls, srcLabel;
+    if(src==='BOTH') v = (gw[name]||'0')+' / '+(dp[name]||'0');
+    else v = (src==='DP'?dp[name]:gw[name])||'—';
+    cls = src==='DP'?'dispatcher':'gateway';
+    srcLabel = src==='DP'?'Dispatcher':'Gateway';
+    return '<div class="metric" data-src="'+cls+'"><div class="m-name">'+name+'</div><div class="m-val">'+v+'</div><div class="m-src">'+srcLabel+' · '+label+'</div></div>';
+  }).join('');
+  grid.innerHTML = html;
+}
+refreshMetrics(); setInterval(refreshMetrics, 3000);
 </script>
 </body>
 </html>`,
