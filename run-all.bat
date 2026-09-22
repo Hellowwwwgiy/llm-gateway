@@ -2,6 +2,7 @@
 REM =========================================================================
 REM SmartProxy - one-click runner (place in project root)
 REM Usage: run-all.bat [start|stop|restart|status|logs]
+REM Ports auto-shift if default 8080/8081 are occupied.
 REM =========================================================================
 
 setlocal EnableDelayedExpansion
@@ -19,6 +20,7 @@ set "REDIS_EXE="
 if exist "D:\agent\other1\redis-tmp\Redis-7.4.4-Windows-x64-msys2\redis-server.exe" set "REDIS_EXE=D:\agent\other1\redis-tmp\Redis-7.4.4-Windows-x64-msys2\redis-server.exe"
 if "%REDIS_EXE%"=="" if exist "C:\Redis\redis-server.exe" set "REDIS_EXE=C:\Redis\redis-server.exe"
 
+REM --- default ports (adjusted if occupied) ---
 set "REDIS_PORT=6379"
 set "GW_PORT=8080"
 set "DP_PORT=8081"
@@ -32,6 +34,21 @@ if "%ACTION%"=="status"  goto :do_status
 if "%ACTION%"=="logs"    goto :do_logs
 echo Usage: run-all.bat [start^|stop^|restart^|status^|logs]
 exit /b 1
+
+REM ==================================================================
+REM Subroutine: find_free_port <starting_port>
+REM Returns the first port >= starting_port that is NOT LISTENING.
+REM Caller must set the result via: call :find_free_port 8080 & set "PORT=!FREE_PORT!"
+REM ==================================================================
+:find_free_port
+set "FREE_PORT=%~1"
+:ffp_loop
+netstat -ano 2>nul | findstr ":!FREE_PORT! " | findstr "LISTENING" >nul
+if errorlevel 1 goto :ffp_ok
+set /a FREE_PORT+=1
+goto :ffp_loop
+:ffp_ok
+exit /b 0
 
 REM ==================================================================
 REM START
@@ -55,8 +72,8 @@ if not exist "%ROOT%\.env" (
     )
 )
 
-REM --- kill stale processes ---
-echo [STEP] Killing stale processes...
+REM --- kill stale SmartProxy processes only (not other apps) ---
+echo [STEP] Killing stale SmartProxy processes...
 taskkill /F /IM %GW_NAME%  >nul 2>&1
 taskkill /F /IM %DP_NAME%  >nul 2>&1
 verify >nul
@@ -64,23 +81,24 @@ timeout /t 1 /nobreak >nul
 
 REM --- Redis ---
 netstat -ano 2>nul | findstr ":%REDIS_PORT% " | findstr "LISTENING" >nul
-if %errorlevel%==0 (
-    echo [OK] Redis already on port %REDIS_PORT%
-    verify >nul
+if !errorlevel!==0 (
+    echo [OK] Redis already on port !REDIS_PORT!
     goto :redis_done
 )
 verify >nul
 
-if "%REDIS_EXE%"=="" (
+call :find_free_port !REDIS_PORT!
+set "REDIS_PORT=!FREE_PORT!"
+if "!REDIS_EXE!"=="" (
     echo [FAIL] redis-server.exe not found.
     echo        Put it at D:\agent\other1\redis-tmp\ or: docker run -p 6379:6379 redis:7-alpine
     exit /b 1
 )
-echo [STEP] Starting Redis...
-start /B "" "%REDIS_EXE%" --port %REDIS_PORT% --save "" --appendonly no > "%RUN%\redis.log" 2> "%RUN%\redis-err.log"
+echo [STEP] Starting Redis on port !REDIS_PORT!...
+start /B "" "!REDIS_EXE!" --port !REDIS_PORT! --save "" --appendonly no > "!RUN!\redis.log" 2> "!RUN!\redis-err.log"
 set /a r=0
 :wait_r
-netstat -ano 2>nul | findstr ":%REDIS_PORT% " | findstr "LISTENING" >nul
+netstat -ano 2>nul | findstr ":!REDIS_PORT! " | findstr "LISTENING" >nul
 if !errorlevel!==0 goto :r_ok
 verify >nul
 set /a r+=1
@@ -88,57 +106,71 @@ if !r! geq 20 ( echo [FAIL] Redis timeout & exit /b 1 )
 timeout /t 0 /nobreak >nul
 goto :wait_r
 :r_ok
-echo [OK] Redis started
+echo [OK] Redis started on :!REDIS_PORT!
 :redis_done
 
-REM --- Gateway ---
-echo [STEP] Starting Gateway :%GW_PORT%...
+REM --- Gateway (auto-pick free port) ---
+call :find_free_port !GW_PORT!
+set "GW_PORT=!FREE_PORT!"
+set "GATEWAY_PORT=!GW_PORT!"
+echo [STEP] Starting Gateway on :!GW_PORT!...
 start /B "" "%DIST%\%GW_NAME%" > "%RUN%\gateway.log" 2> "%RUN%\gateway-err.log"
 set /a r=0
 :wait_g
-netstat -ano 2>nul | findstr ":%GW_PORT% " | findstr "LISTENING" >nul
+netstat -ano 2>nul | findstr ":!GW_PORT! " | findstr "LISTENING" >nul
 if !errorlevel!==0 goto :g_ok
 verify >nul
 set /a r+=1
-if !r! geq 40 ( echo [FAIL] Gateway timeout ^- Log: %RUN%\gateway-err.log & exit /b 1 )
+if !r! geq 40 (
+    echo [FAIL] Gateway timeout on :!GW_PORT! ^- check %RUN%\gateway-err.log
+    exit /b 1
+)
 timeout /t 0 /nobreak >nul
 goto :wait_g
 :g_ok
-echo [OK] Gateway started on :%GW_PORT%
+echo [OK] Gateway ready on :!GW_PORT!
 
-REM --- Dispatcher ---
-echo [STEP] Starting Dispatcher :%DP_PORT%...
+REM --- Dispatcher (auto-pick free port, avoid GW + next) ---
+set /a D_START=!GW_PORT!+1
+call :find_free_port !D_START!
+set "DP_PORT=!FREE_PORT!"
+set "DISPATCHER_PORT=!DP_PORT!"
+echo [STEP] Starting Dispatcher on :!DP_PORT!...
 start /B "" "%DIST%\%DP_NAME%" > "%RUN%\dispatcher.log" 2> "%RUN%\dispatcher-err.log"
 set /a r=0
 :wait_d
-netstat -ano 2>nul | findstr ":%DP_PORT% " | findstr "LISTENING" >nul
+netstat -ano 2>nul | findstr ":!DP_PORT! " | findstr "LISTENING" >nul
 if !errorlevel!==0 goto :d_ok
 verify >nul
 set /a r+=1
-if !r! geq 40 ( echo [WARN] Dispatcher timeout ^- check %RUN%\dispatcher-err.log & goto :d_done )
+if !r! geq 40 (
+    echo [WARN] Dispatcher timeout on :!DP_PORT! ^- check %RUN%\dispatcher-err.log
+    goto :d_done
+)
 timeout /t 0 /nobreak >nul
 goto :wait_d
 :d_ok
-echo [OK] Dispatcher started on :%DP_PORT%
+echo [OK] Dispatcher ready on :!DP_PORT!
 :d_done
 
 echo.
 echo ========== ALL UP ==========
-echo   Frontend:   http://localhost:%GW_PORT%/
-echo   Gateway:    http://localhost:%GW_PORT%
-echo   Dispatcher: http://localhost:%DP_PORT%/metrics
-echo   Redis:      localhost:%REDIS_PORT%
+echo   Frontend:   http://localhost:!GW_PORT!/
+echo   Gateway:    http://localhost:!GW_PORT!/metrics
+echo   Dispatcher: http://localhost:!DP_PORT!/metrics
+echo   Redis:      localhost:!REDIS_PORT!
 echo.
 echo   stop:   run-all.bat stop
 echo   status: run-all.bat status
 echo   logs:   type .run\gateway.log
 echo.
+
 echo [STEP] Opening browser...
-start "" "http://localhost:%GW_PORT%/"
+start "" "http://localhost:!GW_PORT!/"
 timeout /t 1 /nobreak >nul
-start "" "http://localhost:%GW_PORT%/metrics"
+start "" "http://localhost:!GW_PORT!/metrics"
 timeout /t 1 /nobreak >nul
-start "" "http://localhost:%DP_PORT%/metrics"
+start "" "http://localhost:!DP_PORT!/metrics"
 echo [OK] Browser tabs opened
 exit /b 0
 
@@ -178,7 +210,7 @@ REM ==================================================================
 echo.
 echo ========== SmartProxy STATUS ==========
 echo.
-for %%p in (%REDIS_PORT% %GW_PORT% %DP_PORT%) do (
+for %%p in (!REDIS_PORT! !GW_PORT! !DP_PORT!) do (
     set "found=0"
     for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%%p " ^| findstr "LISTENING"') do (
         set "found=1"
