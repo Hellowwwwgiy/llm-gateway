@@ -578,6 +578,15 @@ func indexHTML(redisStatus, mqStatus string, providers, models []string, dispatc
   .metric[data-src="dispatcher"] .m-name{color:#9d7fbf}
   .refresh-hint{font-size:.72rem;color:#64748b;margin-top:.25rem}
   .badge{display:inline-block;background:#334155;color:#cbd5e1;padding:.1rem .5rem;border-radius:4px;font-size:.7rem;margin-left:.5rem}
+  /* Two-panel metrics */
+  .metrics-section{margin-top:2rem}
+  .metrics-tabs{display:flex;gap:.25rem;margin-bottom:1rem;border-bottom:1px solid #334155;padding-bottom:0}
+  .metrics-tab{background:#1e293b;border:1px solid #334155;border-bottom:none;color:#94a3b8;padding:.5rem 1.2rem;border-radius:8px 8px 0 0;cursor:pointer;font-size:.85rem;font-family:inherit}
+  .metrics-tab.active{background:#0f172a;color:#60a5fa;border-color:#60a5fa}
+  .metrics-tab .mt-port{color:#64748b;font-size:.7rem;margin-left:.5rem}
+  .metrics-tab.active .mt-port{color:#a78bfa}
+  .iframe-wrap{background:#0f172a;border:1px solid #334155;border-radius:0 12px 12px 12px;overflow:hidden}
+  .iframe-wrap iframe{width:100%%;height:500px;border:0;background:#0f172a;color:#e2e8f0;font-family:'Consolas',monospace;font-size:.8rem}
 </style>
 </head>
 <body>
@@ -610,10 +619,15 @@ func indexHTML(redisStatus, mqStatus string, providers, models []string, dispatc
     <div id="resp" class="resp">Response will appear here...</div>
   </div>
 
-  <div class="metrics-section">
+  <div class="metrics-section" id="metricsGrid">
     <h2>📊 Live Metrics <span id="metricsBadge" class="badge">refreshing...</span></h2>
-    <div class="metrics-grid" id="metricsGrid"></div>
-    <div class="refresh-hint">Auto-refresh every 3s · Gateway /metrics + Dispatcher /metrics (proxied here)</div>
+    <div class="metrics-tabs">
+      <button class="metrics-tab active" onclick="switchMetric('gw')">Gateway <span class="mt-port">:8080</span></button>
+      <button class="metrics-tab" onclick="switchMetric('dp')">Dispatcher <span class="mt-port">:8081</span></button>
+    </div>
+    <div class="iframe-wrap">
+      <iframe id="metricsIframe" src="/metrics?t=0" onload="onIframeLoad()"></iframe>
+    </div>
   </div>
 </div>
 
@@ -674,58 +688,24 @@ async function sendStream(){
   btn.disabled=false; btn.textContent='Stream';
 }
 
-// ===== Live Metrics =====
-function parseMetrics(text){
-  const result = {};
-  for(const line of text.split('\n')){
-    if(!line || line.startsWith('#')) continue;
-    const sp = line.indexOf(' '); if(sp<0) continue;
-    const nameAndLabel = line.slice(0, sp);
-    const val = line.slice(sp+1).trim();
-    // Skip _bucket / _sum / _count variants unless no plain key
-    if(nameAndLabel.includes('_bucket')||nameAndLabel.includes('_sum')||nameAndLabel.includes('_count')) continue;
-    const name = nameAndLabel.split('{')[0];
-    if(!result[name]) result[name] = val;
-  }
-  return result;
+// ===== Live Metrics (two raw Prometheus panels via iframe) =====
+let metricSrc = 'gw';
+function switchMetric(src){
+  metricSrc = src;
+  document.querySelectorAll('.metrics-tab').forEach(el=>el.classList.remove('active'));
+  event.target.closest('.metrics-tab').classList.add('active');
+  reloadIframe();
 }
-async function refreshMetrics(){
-  const grid = document.getElementById('metricsGrid');
-  const badge = document.getElementById('metricsBadge');
-  let gw = {}, dp = {};
-  try{
-    const [r1, r2] = await Promise.all([
-      fetch('/metrics?t='+Date.now()).catch(()=>null),
-      fetch('/api/v1/metrics/dispatcher?t='+Date.now()).catch(()=>null),
-    ]);
-    if(r1?.ok) gw = parseMetrics(await r1.text());
-    if(r2?.ok) dp = parseMetrics(await r2.text());
-    badge.textContent = 'updated ' + new Date().toLocaleTimeString();
-  }catch(e){ badge.textContent = 'offline'; }
-  const items = [
-    ['http_requests_total','HTTP reqs','GW'],
-    ['http_request_errors_total','HTTP errors','GW'],
-    ['cache_hits_total','Cache hits','GW'],
-    ['cache_misses_total','Cache misses','GW'],
-    ['ratelimit_rejects_total','Rate-limit rej','GW'],
-    ['provider_calls_total','LLM calls','GW'],
-    ['provider_failures_total','LLM failures','GW'],
-    ['mq_publish_total','MQ publishes','GW'],
-    ['mq_consume_total','MQ consumed','DP'],
-    ['mq_consume_failures_total','MQ fail','DP'],
-    ['circuit_breaker_open_total','CB opened','BOTH'],
-  ];
-  const html = items.map(([name,label,src])=>{
-    let v, cls, srcLabel;
-    if(src==='BOTH') v = (gw[name]||'0')+' / '+(dp[name]||'0');
-    else v = (src==='DP'?dp[name]:gw[name])||'—';
-    cls = src==='DP'?'dispatcher':'gateway';
-    srcLabel = src==='DP'?'Dispatcher':'Gateway';
-    return '<div class="metric" data-src="'+cls+'"><div class="m-name">'+name+'</div><div class="m-val">'+v+'</div><div class="m-src">'+srcLabel+' · '+label+'</div></div>';
-  }).join('');
-  grid.innerHTML = html;
+function reloadIframe(){
+  const iframe = document.getElementById('metricsIframe');
+  const url = metricSrc==='dp' ? '/api/v1/metrics/dispatcher' : '/metrics';
+  iframe.src = url + '?t=' + Date.now();
 }
-refreshMetrics(); setInterval(refreshMetrics, 3000);
+function onIframeLoad(){
+  document.getElementById('metricsBadge').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+reloadIframe();
+setInterval(reloadIframe, 3000);
 </script>
 </body>
 </html>`,
