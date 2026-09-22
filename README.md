@@ -85,137 +85,126 @@ smartproxy/
 ├── docker-compose.yml           # Redis + Gateway + Dispatcher（RabbitMQ 可选）
 ├── cmd/
 │   ├── gateway/main.go          # API 网关（主服务）
-│   └── dispatcher/main.go       # 异步调度消费者
+│   └── dispatcher/main.go       # 异步调度消费者（worker pool=8 + 熔断 + 重试）
 ├── internal/
 │   ├── config/config.go         # 环境变量配置加载
 │   ├── auth/jwt.go              # JWT 签发 / 解析
-│   ├── cache/cache.go           # Redis + 内存 fallback
-│   ├── ratelimiter/bucket.go    # 令牌桶（Redis Lua / 本地）
+│   ├── cache/cache.go           # Redis MD5 缓存 + 内存 fallback
+│   ├── ratelimiter/bucket.go    # 令牌桶（Redis Lua 原子脚本 / 本地）
 │   ├── mq/                     # 消息队列（抽象 backend）
 │   │   ├── mq.go               # Client + backend interface
 │   │   ├── rabbitmq.go         # RabbitMQ backend (可选)
-│   │   └── redis.go            # Redis List backend (默认)
+│   │   └── redis.go            # Redis List LPUSH/BRPOP backend (默认)
 │   ├── stats/recorder.go       # Pipeline 异步统计
 │   ├── utils/id.go              # request_id
 │   ├── resilience/
-│   │   ├── circuit.go           # 三态熔断器（Closed→Open→HalfOpen）
-│   │   └── retry.go             # 指数退避重试
+│   │   ├── circuit.go           # 三态熔断器（Closed→Open→HalfOpen，按 provider 隔离）
+│   │   ├── retry.go             # 指数退避重试（最多 3 次）
+│   │   ├── circuit_test.go      # 熔断器单测（3/3 PASS）
+│   │   └── retry_test.go        # 重试单测（4/4 PASS）
+│   ├── ratelimiter/bucket_test.go # 令牌桶单测（3/3 PASS）
 │   ├── metrics/metrics.go       # Prometheus 指标（14 个，Gateway + Dispatcher 各一份）
 │   └── llm/
 │       ├── types.go             # LLMRequest / LLMResponse / Provider 接口
-│       ├── openai_provider.go   # OpenAI 兼容实现
-│       └── router.go            # model → provider 路由
+│       ├── openai_provider.go   # OpenAI 兼容实现（当前已接入 DeepSeek）
+│       └── router.go            # model → provider 路由（一行代码扩新模型）
 ├── scripts/
 │   ├── build.bat                # Windows 一键构建
 │   ├── build.sh                 # Linux / macOS 构建
-│   ├── run-gw.bat               # Windows 快速启动 gateway
+│   ├── run-gw.bat               # Windows 快速启动 gateway（仅 dev）
 │   ├── mock_llm.py              # 本地 mock LLM（非流式 + SSE）
 │   └── test_full.py             # 端到端测试脚本
-├── .run/                        # 运行时日志（gitignored，bat 自动创建）
+├── .run/                        # 运行时日志（gitignored，bat 自动 mkdir）
 │   ├── gateway.log / gateway-err.log
 │   ├── dispatcher.log / dispatcher-err.log
 │   └── redis.log / redis-err.log
 ├── dist/                        # 构建产物（gitignored，bat 自动构建）
-├── go.mod / go.sum
-├── docker-compose.yml           # Redis + Gateway + Dispatcher (RabbitMQ 可选)
-├── Dockerfile                   # 多阶段构建
+├── .env.example                 # 环境变量模板
+├── .env                          # 你的真实 Key（gitignored，bat 自动从 example 复制）
+├── go.mod / go.sum              # Go 1.21
 ├── Makefile
-└── .env.example
+├── INTERVIEW.md                 # 面试弹药库（简历条目 + 技术决策 + Q&A + 行号速查）
+└── README.md
 ```
 
 ## 🚀 快速启动
 
-### 方式零：Docker 一键化（最干净，推荐有 Docker Desktop 的人）
+### 方式一：run-all.bat（本地开发，最推荐）
+
+一键构建 + 启 Redis + Gateway :8080 + Dispatcher :8081，自动开浏览器：
 
 ```powershell
-# 1. 准备 .env
+# 1. 准备 .env（第一次会自动从 .env.example 复制）
 copy .env.example .env
-# 填你自己的 DeepSeek API Key
+#    填你自己的 DeepSeek API Key
 
-# 2. 一键 build + up
-.\docker-up.bat
+# 2. 一键启动
+.\run-all.bat start
+#    端口自动漂移（8080/8081 被占就往后找）
+#    日志: .run\gateway.log / dispatcher.log / redis.log
 
-#    自动:
-#      - 检查 Docker Desktop 是否运行
-#      - docker compose build 双镜像（gateway + dispatcher）
-#      - 启 Redis → gateway :8080 → dispatcher :8081（依赖健康检查顺序）
-#      - 等全部 healthy 后打印访问地址
-
-# 3. 一键 down
-.\docker-down.bat             # 停容器，保留 Redis 数据卷
-.\docker-down.bat --clean     # 停容器 + 清数据卷（下次全新）
-
-# 4. 看日志
-docker logs -f smartproxy-gateway
-docker logs -f smartproxy-dispatcher
-docker logs -f smartproxy-redis
+# 3. 停止
+.\stop.bat              # 杀 Gateway+Dispatcher，保留 Redis
+.\stop.bat --redis      # 全杀（含 Redis）
 ```
 
-compose 内部自动处理的事（你不用管）：
-- `REDIS_ADDR=redis:6379` —— 容器内用 service name DNS，不跟 `.env` 里 `127.0.0.1` 冲突
-- 两个容器都从同一个 `.env` 拿 `OPENAI_API_KEY / JWT_SECRET / 限流参数`
-- RabbitMQ 可选（默认关闭 Redis List 当 MQ）
-- healthcheck 依赖顺序：Redis healthy → Gateway healthy → Dispatcher 启动
-- Redis 数据持久化到 `redis-data` volume，`docker-down.bat --clean` 才会删
-
-### 方式一：一键启动（本地开发，推荐）
+### 方式二：Docker 一键化（干净，有 Docker Desktop 的人）
 
 ```powershell
-# 1. 构建
+copy .env.example .env   # 填 Key
+.\docker-up.bat          # build + compose up -d，等 healthy 后打印地址
+.\docker-down.bat        # 停容器，保留 Redis 数据卷
+.\docker-down.bat --clean # 停容器 + 清数据卷
+docker logs -f smartproxy-gateway
+```
+
+compose 内部自动处理的事：
+- `REDIS_ADDR=redis:6379` —— 容器内 service name DNS，不跟 `.env` 里 `127.0.0.1` 冲突
+- healthcheck 依赖链：Redis healthy → Gateway healthy → Dispatcher 启动
+- RabbitMQ 可选（默认 Redis List 当 MQ，不启用）
+
+### 方式三：手动分进程（调试/定制）
+
+```powershell
+# 终端 A — Redis（Windows 免安装版）
+redis-server.exe --port 6379 --save "" --appendonly no
+
+# 终端 B — Gateway
+$env:Path='D:\Go\bin;' + $env:Path
+$env:GOROOT='D:\Go'
 scripts\build.bat all
+dist\smartproxy-gateway.exe
 
-# 2. 启动 mock LLM（另一个终端）
-python scripts\mock_llm.py
+# 终端 C — Dispatcher
+dist\smartproxy-dispatcher.exe
+```
 
-# 3. 启动 gateway（指向 mock）
+### 方式四：零依赖试跑（内存 fallback）
+
+不想起 Redis、不想填真实 Key？用内置 mock：
+
+```powershell
+python scripts\mock_llm.py             # 另一个终端，端口 9999
 $env:OPENAI_API_KEY="sk-mock"
 $env:OPENAI_BASE_URL="http://localhost:9999"
 $env:OPENAI_MODEL="mock-gpt"
-scripts\run-gw.bat
+scripts\run-gw.bat                     # 只启 gateway，dispatcher 不启
 ```
 
-Gateway 启动后提示：
-```
-[gateway] redis NOT reachable — using in-memory fallback
-[gateway] mq connect failed (async mode disabled)
-[gateway] listening on :8080
-```
+Gateway 日志会提示 `using in-memory fallback`（Redis/MQ 不可用时）。
 
-### 方式二：一键启动（推荐 — Windows）
+### 启动后验证
 
 ```powershell
-# 1. 准备 .env
-copy .env.example .env
-# 填你自己的 DeepSeek API Key
+# Gateway alive
+curl http://localhost:8080/healthz
 
-# 2. 一键启动（构建 + 启 Redis + Gateway :8080 + Dispatcher :8081）
-.\run-all.bat start
+# Prometheus 14 HELP 指标
+curl http://localhost:8080/metrics | findstr "^# HELP" | measure
 
-#    所有服务 up 后会自动打开前端页面: http://localhost:8080/
-#    前端页面里嵌了 Live Metrics —— tab 切换 Gateway/Dispatcher
-#    日志目录:   .run\                  （gateway.log / dispatcher.log / redis.log）
-#    停止:       .\stop.bat             （杀 Gateway + Dispatcher，保留 Redis）
-#    全杀（含 Redis）: .\stop.bat --redis
-#    端口自动漂移: 如果 8080/8081 被占，自动往后找
-```
-
-### 方式三：手动分进程
-
-```powershell
-# 1. 起 Redis（Windows 免安装版）
-redis-server.exe --port 6379 --save "" --appendonly no
-
-# 2. 构建
-scripts\build.bat all
-
-# 3. Gateway（终端 A）
-copy .env.example .env       # 填 Key 后
-$env:Path='D:\Go\bin;' + $env:Path
-$env:GOROOT='D:\Go'
-dist\smartproxy-gateway.exe
-
-# 4. Dispatcher（终端 B）
-dist\smartproxy-dispatcher.exe
+# Dispatcher 指标（方式一：8081 直接访问；方式二：通过 Gateway 代理）
+curl http://localhost:8081/metrics | findstr "mq_consume_total"
+curl http://localhost:8080/api/v1/metrics/dispatcher | findstr "mq_consume_total"
 ```
 
 ## 📡 API 速查
@@ -278,10 +267,10 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/v1/chat/completions/result/$($
 |------|------|------|
 | HTTP | `http_requests_total` | Counter |
 |      | `http_request_errors_total` | Counter |
-|      | `http_request_duration_ms` | Histogram (12 bucket: 5ms → 10s) |
+|      | `http_request_duration_ms` | Histogram (11 定义 bucket + +Inf: 5ms → 10s) |
 | Provider | `provider_calls_total` | Counter |
 |          | `provider_failures_total` | Counter |
-|          | `provider_call_duration_ms` | Histogram |
+|          | `provider_call_duration_ms` | Histogram (同上 bucket) |
 | 缓存 | `cache_hits_total` / `cache_misses_total` | Counter |
 | 限流 | `ratelimit_rejects_total` | Counter |
 | 队列 | `mq_publish_total` / `mq_publish_failures_total` | Counter |
