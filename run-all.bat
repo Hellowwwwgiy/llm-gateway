@@ -180,15 +180,15 @@ echo   status: run-all.bat status
 echo   logs:   type .run\gateway.log
 echo.
 
-echo [STEP] Opening frontend page...
-REM Only the main UI tab. Metrics endpoints listed below for manual curl.
+echo [STEP] Opening browser tabs...
+REM Random query params bypass browser HTTP cache
 set "NOW=!RANDOM!!RANDOM!"
 start "" "http://localhost:!GW_PORT!/?t=!NOW!"
-echo [OK] Frontend opened
-echo.
-echo   Monitor metrics manually:
-echo     curl http://localhost:!GW_PORT!/metrics
-echo     curl http://localhost:!DP_PORT!/metrics
+timeout /t 1 /nobreak >nul
+start "" "http://localhost:!GW_PORT!/metrics?t=!NOW!"
+timeout /t 1 /nobreak >nul
+start "" "http://localhost:!DP_PORT!/metrics?t=!NOW!"
+echo [OK] All 3 tabs opened (frontend + 2 metrics)
 echo.
 exit /b 0
 
