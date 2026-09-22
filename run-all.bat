@@ -166,9 +166,11 @@ echo   logs:   type .run\gateway.log
 echo.
 
 echo [STEP] Opening browser...
-start "" "http://localhost:!GW_PORT!/"
+REM Random query param bypasses browser HTTP cache for the root path
+set "NOW=!RANDOM!!RANDOM!"
+start "" "http://localhost:!GW_PORT!/?t=!NOW!"
 timeout /t 1 /nobreak >nul
-start "" "http://localhost:!GW_PORT!/metrics"
+start "" "http://localhost:!GW_PORT!/metrics?t=!NOW!"
 timeout /t 1 /nobreak >nul
 start "" "http://localhost:!DP_PORT!/metrics"
 echo [OK] Browser tabs opened
