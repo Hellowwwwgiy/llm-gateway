@@ -593,7 +593,7 @@ func indexHTML(redisStatus, mqStatus string, providers, models []string, dispatc
 
   <div class="links">
     <a class="link" href="/healthz" target="_blank">🩺 /healthz</a>
-    <a class="link" href="/metrics" target="_blank">📊 /metrics (Prometheus)</a>
+    <a class="link" href="#metricsGrid">📊 Live Metrics (below)</a>
     <a class="link" href="https://github.com" target="_blank">📖 README</a>
   </div>
 
