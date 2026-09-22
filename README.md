@@ -77,6 +77,8 @@ POST /api/v1/chat/completions
 
 ```
 smartproxy/
+├── run-all.bat                  # Windows 一键 start|stop|restart|status|logs
+├── stop.bat                     # 强制杀进程 + 释放端口（支持 --redis）
 ├── cmd/
 │   ├── gateway/main.go          # API 网关（主服务）
 │   └── dispatcher/main.go       # 异步调度消费者
@@ -94,7 +96,7 @@ smartproxy/
 │   ├── resilience/
 │   │   ├── circuit.go           # 三态熔断器（Closed→Open→HalfOpen）
 │   │   └── retry.go             # 指数退避重试
-│   ├── metrics/metrics.go       # Prometheus 指标（16 个）
+│   ├── metrics/metrics.go       # Prometheus 指标（14 个，Gateway + Dispatcher 各一份）
 │   └── llm/
 │       ├── types.go             # LLMRequest / LLMResponse / Provider 接口
 │       ├── openai_provider.go   # OpenAI 兼容实现
@@ -105,6 +107,11 @@ smartproxy/
 │   ├── run-gw.bat               # Windows 快速启动 gateway
 │   ├── mock_llm.py              # 本地 mock LLM（非流式 + SSE）
 │   └── test_full.py             # 端到端测试脚本
+├── .run/                        # 运行时日志（gitignored，bat 自动创建）
+│   ├── gateway.log / gateway-err.log
+│   ├── dispatcher.log / dispatcher-err.log
+│   └── redis.log / redis-err.log
+├── dist/                        # 构建产物（gitignored，bat 自动构建）
 ├── go.mod / go.sum
 ├── docker-compose.yml           # Redis + Gateway + Dispatcher (RabbitMQ 可选)
 ├── Dockerfile                   # 多阶段构建
@@ -137,29 +144,41 @@ Gateway 启动后提示：
 [gateway] listening on :8080
 ```
 
-### 方式二：真实 Redis + DeepSeek（推荐）
+### 方式二：一键启动（推荐 — Windows）
 
 ```powershell
-# 1. 起 Redis（Windows 免安装版，已在项目 docs 里说明）
-#    或 Docker Desktop: docker compose up -d redis
-
-# 2. 配置真实 DeepSeek
+# 1. 准备 .env
 copy .env.example .env
-# .env.example 是模板，填你自己的 DeepSeek API Key
+# 填你自己的 DeepSeek API Key
 
-# 3. 启动 gateway + dispatcher
+# 2. 一键启动（构建 + 启 Redis + Gateway :8080 + Dispatcher :8081）
+.\run-all.bat start
+
+#    所有服务 up 后会自动打开前端页面: http://localhost:8080/
+#    前端页面里嵌了 Live Metrics —— tab 切换 Gateway/Dispatcher
+#    日志目录:   .run\                  （gateway.log / dispatcher.log / redis.log）
+#    停止:       .\stop.bat             （杀 Gateway + Dispatcher，保留 Redis）
+#    全杀（含 Redis）: .\stop.bat --redis
+#    端口自动漂移: 如果 8080/8081 被占，自动往后找
+```
+
+### 方式三：手动分进程
+
+```powershell
+# 1. 起 Redis（Windows 免安装版）
+redis-server.exe --port 6379 --save "" --appendonly no
+
+# 2. 构建
 scripts\build.bat all
-dist\smartproxy-gateway.exe      # 另一个终端
-dist\smartproxy-dispatcher.exe   # Redis BRPOP 消费
-```
 
-Gateway 启动日志：
-```
-[config] loaded .env
-[gateway] redis connected (127.0.0.1:6379)
-[MQ] redis queue connected on 127.0.0.1:6379 (lpush/brpop, key=smartproxy:queue:async_chat)
-[gateway] mq connected: redis-queue (async ready)
-[gateway] listening on :8080
+# 3. Gateway（终端 A）
+copy .env.example .env       # 填 Key 后
+$env:Path='D:\Go\bin;' + $env:Path
+$env:GOROOT='D:\Go'
+dist\smartproxy-gateway.exe
+
+# 4. Dispatcher（终端 B）
+dist\smartproxy-dispatcher.exe
 ```
 
 ## 📡 API 速查
@@ -171,8 +190,10 @@ Gateway 启动日志：
 | POST | `/api/v1/chat/completions/async` | 异步入队，返回 request_id | ✅ Bearer |
 | GET  | `/api/v1/chat/completions/result/:id` | 轮询异步结果 | ✅ Bearer |
 | GET  | `/api/v1/stats/daily` | 当日用量统计 | ✅ Bearer |
-| GET  | `/metrics` | Prometheus 指标 | ❌ |
+| GET  | `/metrics` | Gateway Prometheus 指标（text/plain，14 HELP） | ❌ |
 | GET  | `/healthz` | 健康检查 | ❌ |
+| GET  | `/api/v1/metrics/dispatcher` | Dispatcher Prometheus 指标（Gateway 反向代理，14 HELP） | ❌ |
+| GET  | `/api/v1/metrics/html?src=gateway\|dispatcher` | 前端 iframe 用（text/html，白字黑底） | ❌ |
 
 ### curl 示例
 
