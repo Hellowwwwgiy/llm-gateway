@@ -77,8 +77,12 @@ POST /api/v1/chat/completions
 
 ```
 smartproxy/
-├── run-all.bat                  # Windows 一键 start|stop|restart|status|logs
+├── run-all.bat                  # Windows 一键 start|stop|restart|status|logs（本地开发）
 ├── stop.bat                     # 强制杀进程 + 释放端口（支持 --redis）
+├── docker-up.bat                # Docker 一键 build + up
+├── docker-down.bat              # Docker 一键 down（--clean 清卷）
+├── Dockerfile                   # 多阶段构建（gateway + dispatcher 共用）
+├── docker-compose.yml           # Redis + Gateway + Dispatcher（RabbitMQ 可选）
 ├── cmd/
 │   ├── gateway/main.go          # API 网关（主服务）
 │   └── dispatcher/main.go       # 异步调度消费者
@@ -121,7 +125,40 @@ smartproxy/
 
 ## 🚀 快速启动
 
-### 方式一：内存 fallback（零依赖，最快）
+### 方式零：Docker 一键化（最干净，推荐有 Docker Desktop 的人）
+
+```powershell
+# 1. 准备 .env
+copy .env.example .env
+# 填你自己的 DeepSeek API Key
+
+# 2. 一键 build + up
+.\docker-up.bat
+
+#    自动:
+#      - 检查 Docker Desktop 是否运行
+#      - docker compose build 双镜像（gateway + dispatcher）
+#      - 启 Redis → gateway :8080 → dispatcher :8081（依赖健康检查顺序）
+#      - 等全部 healthy 后打印访问地址
+
+# 3. 一键 down
+.\docker-down.bat             # 停容器，保留 Redis 数据卷
+.\docker-down.bat --clean     # 停容器 + 清数据卷（下次全新）
+
+# 4. 看日志
+docker logs -f smartproxy-gateway
+docker logs -f smartproxy-dispatcher
+docker logs -f smartproxy-redis
+```
+
+compose 内部自动处理的事（你不用管）：
+- `REDIS_ADDR=redis:6379` —— 容器内用 service name DNS，不跟 `.env` 里 `127.0.0.1` 冲突
+- 两个容器都从同一个 `.env` 拿 `OPENAI_API_KEY / JWT_SECRET / 限流参数`
+- RabbitMQ 可选（默认关闭 Redis List 当 MQ）
+- healthcheck 依赖顺序：Redis healthy → Gateway healthy → Dispatcher 启动
+- Redis 数据持久化到 `redis-data` volume，`docker-down.bat --clean` 才会删
+
+### 方式一：一键启动（本地开发，推荐）
 
 ```powershell
 # 1. 构建

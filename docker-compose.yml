@@ -1,9 +1,17 @@
 version: "3.9"
 
+# =========================================================================
+# SmartProxy docker-compose
+# Usage:
+#   docker compose up -d --build          ← 一键构建 + 启动（推荐用 docker-up.bat）
+#   docker compose down                    ← 停
+#   docker compose down --volumes          ← 停 + 清 Redis 数据卷
+# =========================================================================
+
 services:
-  # ===== 中间件 =====
   redis:
     image: redis:7-alpine
+    container_name: smartproxy-redis
     ports:
       - "6379:6379"
     command: ["redis-server", "--appendonly", "yes"]
@@ -14,41 +22,52 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
-  rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"      # AMQP
-      - "15672:15672"    # 管理界面
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmqctl", "status"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # ===== 可选 RabbitMQ — 默认用 Redis List 当 MQ，不用它 =====
+  # 要启用 RabbitMQ：(1) 取消下面 service 注释 (2) gateway/dispatcher 的 depends_on + environment 里 RABBITMQ_URL 也取消注释
+  # rabbitmq:
+  #   image: rabbitmq:3-management
+  #   container_name: smartproxy-rabbitmq
+  #   ports:
+  #     - "5672:5672"
+  #     - "15672:15672"
+  #   environment:
+  #     RABBITMQ_DEFAULT_USER: guest
+  #     RABBITMQ_DEFAULT_PASS: guest
+  #   volumes:
+  #     - rabbitmq-data:/var/lib/rabbitmq
+  #   healthcheck:
+  #     test: ["CMD", "rabbitmqctl", "status"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: unless-stopped
 
-  # ===== 应用服务 =====
   gateway:
     build:
       context: .
       dockerfile: Dockerfile
       args:
         BINARY: gateway
+    container_name: smartproxy-gateway
     ports:
       - "8080:8080"
     env_file:
-      - .env
+      - .env                      # OPENAI_API_KEY / JWT_SECRET / 限流 等敏感配置
+    environment:
+      # 覆盖 .env 里的 localhost —— compose 内部 DNS 用 service name
+      REDIS_ADDR: "redis:6379"
+      # DISPATCHER_PORT: "8081"   # 如果 dispatcher 容器改了端口再设，默认 8081 不用动
+      # RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"   # 启用 RabbitMQ 时取消注释
     depends_on:
       redis:
         condition: service_healthy
-      # rabbitmq 是可选的 — 默认用 Redis List 当 MQ（lpush/brpop）
-      # 要启用 RabbitMQ，取消下面两行的注释 + gateway 环境变量 RABBITMQ_URL
-      # rabbitmq:
-      #   condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   dispatcher:
@@ -57,13 +76,26 @@ services:
       dockerfile: Dockerfile
       args:
         BINARY: dispatcher
+    container_name: smartproxy-dispatcher
+    ports:
+      - "8081:8081"
     env_file:
       - .env
+    environment:
+      REDIS_ADDR: "redis:6379"
+      # RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
     depends_on:
       redis:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8081/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
 volumes:
   redis-data:
-  rabbitmq-data:
+  # rabbitmq-data:        # 启用 RabbitMQ 时取消注释
