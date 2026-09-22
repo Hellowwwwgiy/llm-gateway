@@ -221,6 +221,8 @@ func (a *App) index(c *gin.Context) {
 	providers := a.router.RegisteredProviders()
 	models := a.router.RegisteredModels()
 
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	c.Header("Pragma", "no-cache")
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(indexHTML(redisStatus, mqStatus, providers, models)))
 }
 
