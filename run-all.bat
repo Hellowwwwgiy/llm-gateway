@@ -72,10 +72,23 @@ if not exist "%ROOT%\.env" (
     )
 )
 
-REM --- kill stale SmartProxy processes only (not other apps) ---
-echo [STEP] Killing stale SmartProxy processes...
+REM --- kill stale: SmartProxy by exe name, then any process on default ports ---
+echo [STEP] Cleaning ports %GW_PORT% / %DP_PORT%...
 taskkill /F /IM %GW_NAME%  >nul 2>&1
 taskkill /F /IM %DP_NAME%  >nul 2>&1
+verify >nul
+timeout /t 1 /nobreak >nul
+
+REM Kill any process still occupying default gateway port
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%GW_PORT% " ^| findstr "LISTENING"') do (
+    echo   Port %GW_PORT% held by PID %%a ^- killing...
+    taskkill /F /PID %%a >nul 2>&1
+)
+REM Kill any process still occupying default dispatcher port
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%DP_PORT% " ^| findstr "LISTENING"') do (
+    echo   Port %DP_PORT% held by PID %%a ^- killing...
+    taskkill /F /PID %%a >nul 2>&1
+)
 verify >nul
 timeout /t 1 /nobreak >nul
 
@@ -113,6 +126,7 @@ REM --- Gateway (auto-pick free port) ---
 call :find_free_port !GW_PORT!
 set "GW_PORT=!FREE_PORT!"
 set "GATEWAY_PORT=!GW_PORT!"
+set "SMARTPROXY_PROCESS=gateway"
 echo [STEP] Starting Gateway on :!GW_PORT!...
 start /B "" "%DIST%\%GW_NAME%" > "%RUN%\gateway.log" 2> "%RUN%\gateway-err.log"
 set /a r=0
@@ -135,6 +149,7 @@ set /a D_START=!GW_PORT!+1
 call :find_free_port !D_START!
 set "DP_PORT=!FREE_PORT!"
 set "DISPATCHER_PORT=!DP_PORT!"
+set "SMARTPROXY_PROCESS=dispatcher"
 echo [STEP] Starting Dispatcher on :!DP_PORT!...
 start /B "" "%DIST%\%DP_NAME%" > "%RUN%\dispatcher.log" 2> "%RUN%\dispatcher-err.log"
 set /a r=0
@@ -165,15 +180,16 @@ echo   status: run-all.bat status
 echo   logs:   type .run\gateway.log
 echo.
 
-echo [STEP] Opening browser...
-REM Random query param bypasses browser HTTP cache for the root path
+echo [STEP] Opening frontend page...
+REM Only the main UI tab. Metrics endpoints listed below for manual curl.
 set "NOW=!RANDOM!!RANDOM!"
 start "" "http://localhost:!GW_PORT!/?t=!NOW!"
-timeout /t 1 /nobreak >nul
-start "" "http://localhost:!GW_PORT!/metrics?t=!NOW!"
-timeout /t 1 /nobreak >nul
-start "" "http://localhost:!DP_PORT!/metrics"
-echo [OK] Browser tabs opened
+echo [OK] Frontend opened
+echo.
+echo   Monitor metrics manually:
+echo     curl http://localhost:!GW_PORT!/metrics
+echo     curl http://localhost:!DP_PORT!/metrics
+echo.
 exit /b 0
 
 REM ==================================================================
