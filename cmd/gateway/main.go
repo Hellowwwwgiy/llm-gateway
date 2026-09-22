@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"strconv"
@@ -117,6 +118,7 @@ func main() {
 	r.GET("/healthz", app.healthz)
 	r.GET("/metrics", wrapHandler(metrics.Handler()))
 	r.GET("/api/v1/metrics/dispatcher", app.dispatcherMetricsProxy)
+	r.GET("/api/v1/metrics/html", app.metricsHTML)
 
 	r.POST("/api/v1/login", app.login)
 
@@ -238,6 +240,31 @@ func (a *App) dispatcherMetricsProxy(c *gin.Context) {
 	defer r.Body.Close()
 	body, _ := io.ReadAll(r.Body)
 	c.Data(r.StatusCode, "text/plain; charset=utf-8", body)
+}
+
+func (a *App) metricsHTML(c *gin.Context) {
+	src := c.Query("src")
+	var body string
+	if src == "dispatcher" {
+		target := fmt.Sprintf("http://127.0.0.1:%d/metrics", a.cfg.DispatcherPort)
+		r, err := http.Get(target)
+		if err != nil {
+			body = fmt.Sprintf("dispatcher unreachable: %v", err)
+		} else {
+			defer r.Body.Close()
+			b, _ := io.ReadAll(r.Body)
+			body = string(b)
+		}
+	} else {
+		rec := httptest.NewRecorder()
+		metrics.Handler().ServeHTTP(rec, c.Request)
+		body = rec.Body.String()
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(
+		"<html><head><meta charset='utf-8'></head>"+
+			"<body style='background:#0f172a;color:#ffffff;font-family:Consolas,monospace;font-size:13px;margin:1rem 1.5rem;white-space:pre;line-height:1.5'>"+
+			body+
+			"</body></html>"))
 }
 
 func (a *App) login(c *gin.Context) {
@@ -698,8 +725,8 @@ function switchMetric(src){
 }
 function reloadIframe(){
   const iframe = document.getElementById('metricsIframe');
-  const url = metricSrc==='dp' ? '/api/v1/metrics/dispatcher' : '/metrics';
-  iframe.src = url + '?t=' + Date.now();
+  const src = metricSrc==='dp' ? 'dispatcher' : 'gateway';
+  iframe.src = '/api/v1/metrics/html?src=' + src + '&t=' + Date.now();
 }
 function onIframeLoad(){
   document.getElementById('metricsBadge').textContent = 'updated ' + new Date().toLocaleTimeString();
