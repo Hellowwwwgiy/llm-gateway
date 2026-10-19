@@ -27,3 +27,6 @@ redis-data/
 rabbitmq-data/
 *.log
 redis_info.txt
+
+# Interview notes (local only, not for public repo)
+INTERVIEW*.md

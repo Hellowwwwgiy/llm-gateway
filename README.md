@@ -151,8 +151,7 @@ smartproxy/
 ├── .run/                        # 运行日志（gitignored）
 ├── dist/                        # 构建产物（gitignored）
 ├── .env.example                 # 环境变量模板
-├── INTERVIEW.md                 # 面试弹药库
-├── INTERVIEW_PREP.md            # 简历逐条深挖 + 追问题链
+├── go.mod / go.sum              # Go 1.21
 └── README.md
 ```
 
@@ -469,21 +468,7 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/v1/chat/completions/result/$($
 
 ---
 
-## 十、面试考点速查
-
-| 模块 | 考点 |
-|------|------|
-| 分布式限流 | Redis Lua 原子性 vs WATCH/MULTI、令牌桶 vs 漏桶、QPS vs TPM |
-| 缓存策略 | MD5 去重、穿透/击穿/雪崩、SingleFlight 合并并发 |
-| 熔断降级 | 三态状态机、按 provider 隔离、fallback 自动切换 |
-| 异步解耦 | Redis List LPUSH/BRPOP、死信队列、retry_count 语义 |
-| 高并发 | Worker Pool + prefetch、goroutine 泄漏防护、context 传递 |
-| 可观测 | Prometheus Histogram bucket 设计、label 基数控制、trace_id 链路 |
-| 工程化 | Docker Compose 编排、优雅关闭、GitHub Actions CI |
-
----
-
-## 十一、后续扩展方向
+## 十、后续扩展方向
 
 - [ ] 接入通义 / 豆包 Provider（OpenAI 兼容，加一个 provider 文件）
 - [ ] Redis Sentinel / Cluster 高可用
