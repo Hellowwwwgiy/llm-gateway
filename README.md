@@ -69,24 +69,13 @@ SmartProxy 是一个 Go + Gin 实现的多模型 LLM API 网关。用户调一�
    └─────────────────────┘
 ```
 
-### 2.2 为什么双进程？
+### 2.2 双进程架构
 
-| 维度 | 单体 | 双进程（Gateway + Dispatcher） |
-|------|------|------------------------------|
-| 扩缩容 | 只能整体扩 | Gateway 接流量、Dispatcher 消费，独立扩 |
-| 可观测 | 指标混在一起 | Gateway/Dispatcher 各一份 metrics，Prometheus 按 job 区分 |
-| 故障隔离 | 一处挂全挂 | Dispatcher 消费异常不影响 Gateway 接请求 |
-| 职责 | 混在一起 | Gateway 扛 HTTP，Dispatcher 扛异步消费 |
+Gateway 负责承接 HTTP 流量，Dispatcher 负责异步消息消费，两个进程独立部署、独立扩缩容、互不影响。这样 Dispatcher 消费积压或异常时不会拖垮 Gateway 的同步接口；Prometheus 也能按 job 区分采集两个进程的指标，故障定位更清晰。
 
-### 2.3 为什么 Redis 一肩三挑？
+### 2.3 Redis 一肩三挑
 
-| 职责 | 数据结构 | 为什么用 Redis |
-|------|---------|---------------|
-| 限流 | Hash (tokens + last) | Lua 原子脚本，一次 RTT 完成加令牌+扣令牌 |
-| 缓存 | String (JSON) | SET/GET 毫秒级，TTL 自动过期 |
-| 队列 | List (LPUSH/BRPOP) | 零额外组件，Sidekiq/Bull/Celery 同款方案 |
-
-> 已依赖 Redis 做限流和缓存，再加 RabbitMQ 运维成本翻倍。`mq.New(url)` 自动判断协议（`amqp://` 走 RabbitMQ），生产要换 MQ 一行配置。
+项目已经依赖 Redis 做限流和缓存，再引入 RabbitMQ 会显著增加运维成本，因此队列也复用 Redis List（LPUSH/BRPOP）。这套方案在 Sidekiq、Bull、Celery 等成熟项目中被广泛验证。限流用 Hash 存 tokens + last 配合 Lua 原子脚本，缓存用 String 存 JSON 并设 TTL，队列用 List + 死信 List。`mq.New(url)` 会自动判断协议——传 `amqp://` 自动切 RabbitMQ，生产要换 MQ 只需改一行配置。
 
 ---
 
@@ -235,130 +224,37 @@ Gateway                    Redis List                  Dispatcher
 
 ---
 
-## 六、技术难点与解决方案
+## 六、技术实现要点
 
 ### 6.1 分布式限流：Redis Lua 原子令牌桶
 
-**难点**：加令牌 + 扣令牌必须原子性，否则高并发下超发。
+令牌桶的"补充 + 扣减"必须原子执行，否则高并发下会超发。这里用 Redis Lua 脚本一次 RTT 完成全部逻辑，比 WATCH/MULTI 乐观锁更高效——后者在高并发下会产生大量事务冲突重试。脚本逻辑：从 Hash 读 tokens 和 last，按 `elapsed * qps` 补充令牌（cap 到容量），够用就扣减写回并返回 1，否则返回 0。
 
-**方案**：`ratelimiter/bucket.go:82-113` Lua 脚本一次 RTT 完成：
-
-```lua
-local bucket = redis.call('HMGET', key, 'tokens', 'last')
--- 计算补充的令牌
-tokens = math.min(cap, tokens + elapsed * qps)
--- 扣令牌
-if tokens >= requested then
-    tokens = tokens - requested
-    redis.call('HMSET', key, 'tokens', tokens, 'last', now)
-    return 1  -- 放行
-else
-    return 0  -- 拒绝
-end
-```
-
-**为什么不用 WATCH/MULTI**：乐观锁在高并发下产生大量事务冲突重试，性能差。Lua 脚本在 Redis 单线程内原子执行，无竞争。
-
-**限流维度**：`ratelimit:user:{userId}:model:{model}` —— 每个用户每个模型独立令牌桶，避免一个模型用光额度影响其他模型。
+限流 key 设计为 `ratelimit:user:{userId}:model:{model}`，每个用户对每个模型拥有独立的令牌桶，避免某个模型流量大时把其他模型的额度一起用光。
 
 ### 6.2 缓存击穿防护：SingleFlight
 
-**难点**：热点 key 过期瞬间，100 个并发请求同时 miss → 100 个请求同时调 LLM → 浪费 token + 压垮后端。
+热点 key 过期瞬间，大量并发请求同时 miss 会同时打到 LLM 后端，造成 token 浪费和后端压力。这里自研了 SingleFlight 组件（不依赖 golang.org/x/sync），核心是用 `map[string]*call` + `sync.WaitGroup` 记录正在执行的调用：同 key 的后续请求直接等待第一个请求的结果，只有第一个请求真正调用 LLM。调用完成后从 map 删除 key，让下一批请求重新执行。
 
-**方案**：自研 SingleFlight（`cache/cache.go:189-236`，无额外依赖）：
-
-```go
-func (sf *SingleFlight) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
-    sf.mu.Lock()
-    if c, ok := sf.m[key]; ok {
-        // 已有同 key 调用在进行，等待结果
-        sf.mu.Unlock()
-        c.wg.Wait()
-        return c.val, c.err
-    }
-    // 第一个请求，创建 call 并执行 fn
-    c := &sfCall{}
-    c.wg.Add(1)
-    sf.m[key] = c
-    sf.mu.Unlock()
-    c.val, c.err = fn()
-    c.wg.Done()
-    // 执行完移除 key
-    sf.mu.Lock()
-    delete(sf.m, key)
-    sf.mu.Unlock()
-    return c.val, c.err
-}
-```
-
-同 prompt 的并发请求只有第一个调 LLM，其余阻塞等待第一个完成后拿到同样结果。
+缓存 key 基于 `model + md5(json.Marshal(LLMRequest))` 生成，保证相同 prompt 命中同一缓存。
 
 ### 6.3 三态熔断 + 按 provider 隔离 + fallback
 
-**难点**：全局熔断会导致一家 LLM 挂了全都不能用；熔断后直接 503 用户体验差。
+熔断器是经典三态状态机：Closed 放行并记录结果，连续失败 5 次切 Open 直接拒绝，30 秒后进入 HalfOpen 放一个试探请求，成功回 Closed、失败回 Open。
 
-**方案**：`resilience/circuit.go` + `llm/router.go`
-
-```
-Closed ──(连续失败 ≥ 5)──► Open
-  ▲                           │
-  │  RecordSuccess()           │ 30s 后
-  │                           ▼
-  │                      HalfOpen
-  │                           │
-  │    试探成功 ───────────────┤  试探失败
-  │                           ▼
-  └─────────────────────► Open
-```
-
-- **隔离**：`resilience.NewGroup(5, 30*time.Second)` → `group.Get("deepseek")` / `group.Get("qwen")` 各拿各的熔断器
-- **fallback**：`router.RegisterFallback("deepseek", "qwen-plus", "doubao-pro")` 声明备用，主 provider 熔断时自动遍历 fallback 找未熔断的，全熔断才返回 503
+熔断器按 provider 隔离：`resilience.NewGroup(5, 30s)` 维护一个 map，`group.Get("deepseek")` 和 `group.Get("qwen")` 各拿各的实例。这样一家 LLM 挂了不影响其他家。在此基础上，`router.RegisterFallback("deepseek", "qwen-plus", "doubao-pro")` 声明备用 provider，主 provider 熔断时自动遍历 fallback 列表找第一个未熔断的，全部熔断才返回 503。
 
 ### 6.4 异步队列：消息重试 + 死信
 
-**难点**：消费失败不能无限重试，也不能直接丢。
-
-**方案**：消息体带 `retry_count` 字段：
-
-```
-消费失败 → retry_count++
-  ├─ < 3 → NackRequeue（带新 retry_count 重新入队）
-  └─ ≥ 3 → NackDead（进死信队列 + 写错误结果到 async_result）
-```
-
-死信队列 `smartproxy:queue:dlq` 可人工扫描重新入队或报警。
+消息体携带 `retry_count` 字段。消费失败时 retry_count +1：小于 3 次重新入队（带着更新后的 retry_count），达到 3 次进入死信队列 `smartproxy:queue:dlq` 并把错误结果写入 `async_result:{id}`，客户端轮询时拿到明确的失败信息而非永远 pending。熔断场景不算业务失败，retry_count 不递增，等熔断恢复后自然重试。
 
 ### 6.5 链路追踪：trace_id
 
-**难点**：Gateway 入队和 Dispatcher 消费是两个进程，日志无法关联。
-
-**方案**：Gateway auth middleware 生成 `trace_id`，写进消息体，Dispatcher 所有日志打印 `trace=xxx`：
-
-```
-Gateway:  [gateway] trace=abc123 async request_id=xyz...
-Dispatcher: [worker 3] trace=abc123 processing request_id=xyz...
-Dispatcher: [worker 3] trace=abc123 done latency_ms=1327
-```
+Gateway 和 Dispatcher 是两个独立进程，日志无法直接关联。Gateway 的 auth middleware 为每个请求生成 trace_id 并注入 context，异步入队时写进消息体；Dispatcher 消费时取出 trace_id，在 processing、失败、完成三条关键日志里都带上 `trace=xxx`，实现跨进程的日志串联。
 
 ### 6.6 Prometheus 指标设计
 
-**难点**：指标要覆盖全链路，但 label 基数不能爆。
-
-**方案**：14 个指标，只留 `provider` / `model` 两个 label，绝不放 `user_id`（否则每个用户一个 time series）：
-
-| 分类 | 指标 | 类型 |
-|------|------|------|
-| HTTP | http_requests_total | Counter |
-|      | http_request_errors_total | Counter |
-|      | http_request_duration_ms | Histogram (11 bucket: 5ms→10s) |
-| Provider | provider_calls_total | Counter |
-|          | provider_failures_total | Counter |
-|          | provider_call_duration_ms | Histogram |
-| 缓存 | cache_hits_total / cache_misses_total | Counter |
-| 限流 | ratelimit_rejects_total | Counter |
-| 队列 | mq_publish_total / mq_publish_failures_total | Counter |
-|      | mq_consume_total / mq_consume_failures_total | Counter |
-| 熔断 | circuit_breaker_open_total | Counter |
+全链路共 14 个指标，覆盖 HTTP、Provider、缓存、限流、队列、熔断六类。label 只保留 `provider` 和 `model` 两个维度——绝对不能放 `user_id`，否则每个用户产生独立 time series，基数爆炸。Histogram 用 11 个 bucket（5ms → 10s）覆盖 LLM 调用的延迟范围。Gateway 和 Dispatcher 各自注册独立的 metrics endpoint（8080/8081），Prometheus 按 job 区分。
 
 ---
 
