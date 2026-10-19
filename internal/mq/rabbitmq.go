@@ -85,7 +85,7 @@ func (b *rabbitBackend) Close() error {
 
 func (b *rabbitBackend) Name() string { return b.name }
 
-func (b *rabbitBackend) Consume(ctx context.Context, handler func(*RequestMessage, func() error, func() error, func() error) bool) error {
+func (b *rabbitBackend) Consume(ctx context.Context, handler func(*RequestMessage, func() error, func([]byte) error, func([]byte) error) bool) error {
 	deliveries, err := b.channel.ConsumeWithContext(ctx,
 		QueueAsyncChat,
 		"smartproxy-dispatcher",
@@ -113,8 +113,9 @@ func (b *rabbitBackend) Consume(ctx context.Context, handler func(*RequestMessag
 			}
 
 			ack := func() error { return d.Ack(false) }
-			nack := func() error { return d.Nack(false, true) }  // requeue
-			dead := func() error { return d.Nack(false, false) } // → dlq
+			// RabbitMQ nack requeue 用原消息，不重新 publish（保留重试次数由 dispatcher 在 msg 里记录）
+			nack := func(_ []byte) error { return d.Nack(false, true) }  // requeue
+			dead := func(_ []byte) error { return d.Nack(false, false) } // → dlq
 
 			if !handler(&msg, ack, nack, dead) {
 				return nil

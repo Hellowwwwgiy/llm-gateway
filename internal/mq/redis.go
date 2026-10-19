@@ -72,7 +72,7 @@ func (b *redisBackend) SetQoS(int) error { return nil }
 func (b *redisBackend) Close() error      { return b.rdb.Close() }
 func (b *redisBackend) Name() string       { return b.name }
 
-func (b *redisBackend) Consume(ctx context.Context, handler func(*RequestMessage, func() error, func() error, func() error) bool) error {
+func (b *redisBackend) Consume(ctx context.Context, handler func(*RequestMessage, func() error, func([]byte) error, func([]byte) error) bool) error {
 	log.Printf("[MQ] redis consumer started on %s (dlq=%s)", b.queueKey, b.deadKey)
 	for {
 		// BRPOP 阻塞等待；timeout=0 无限等
@@ -105,17 +105,17 @@ func (b *redisBackend) Consume(ctx context.Context, handler func(*RequestMessage
 
 		// Redis BRPOP 已经从队列移除了，ack 就是 no-op
 		ack := func() error { return nil }
-		// requeue: 推回首部
-		nack := func() error {
+		// requeue: 用更新后的 body（含 RetryCount）推回首部
+		nack := func(newBody []byte) error {
 			ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			return b.rdb.LPush(ctx2, b.queueKey, body).Err()
+			return b.rdb.LPush(ctx2, b.queueKey, newBody).Err()
 		}
-		// dead: 推进死信队列
-		dead := func() error {
+		// dead: 用更新后的 body 推进死信队列
+		dead := func(newBody []byte) error {
 			ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			return b.rdb.LPush(ctx2, b.deadKey, body).Err()
+			return b.rdb.LPush(ctx2, b.deadKey, newBody).Err()
 		}
 
 		if !handler(&msg, ack, nack, dead) {

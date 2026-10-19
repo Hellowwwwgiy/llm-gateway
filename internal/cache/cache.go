@@ -153,6 +153,11 @@ func cacheKey(model string, reqBody interface{}) string {
 	return fmt.Sprintf("llmcache:%s:%s", model, hex.EncodeToString(sum[:]))
 }
 
+// CacheKey 导出缓存 key 计算（供 singleflight 合并同 key 并发请求）
+func CacheKey(model string, reqBody interface{}) string {
+	return cacheKey(model, reqBody)
+}
+
 // GetLLM 尝试命中相同 model+prompt 的结果
 func (c *Cache) GetLLM(ctx context.Context, model string, reqBody interface{}, out interface{}) bool {
 	key := cacheKey(model, reqBody)
@@ -185,3 +190,52 @@ func (c *Cache) GetAsyncResult(ctx context.Context, requestID string, out interf
 // ============ Redis client 直接暴露（限流需要） ============
 
 func (c *Cache) RDB() *redis.Client { return c.rdb }
+
+// ============ SingleFlight 防缓存击穿 ============
+// 热点 key 过期瞬间，多个并发请求同时 miss → 同时调 LLM → 浪费 token。
+// SingleFlight 合并同 key 的并发请求，只让第一个调 LLM，其余等结果。
+
+type sfCall struct {
+	wg  sync.WaitGroup
+	val interface{}
+	err error
+}
+
+// SingleFlight 同 key 并发请求合并器（不依赖 golang.org/x/sync，自研实现）
+type SingleFlight struct {
+	mu sync.Mutex
+	m  map[string]*sfCall
+}
+
+// NewSingleFlight 新建
+func NewSingleFlight() *SingleFlight {
+	return &SingleFlight{m: make(map[string]*sfCall)}
+}
+
+// Do 同 key 的并发调用只执行一次 fn，其余等待结果复用
+// key 相同的并发请求：第一个执行 fn，其余阻塞等待第一个完成后拿到同样结果
+func (sf *SingleFlight) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+	sf.mu.Lock()
+	if c, ok := sf.m[key]; ok {
+		// 已有同 key 调用在进行，等待
+		sf.mu.Unlock()
+		c.wg.Wait()
+		return c.val, c.err
+	}
+	// 第一个请求，创建 call
+	c := &sfCall{}
+	c.wg.Add(1)
+	sf.m[key] = c
+	sf.mu.Unlock()
+
+	// 执行 fn
+	c.val, c.err = fn()
+	c.wg.Done()
+
+	// 执行完移除 key，让后续请求重新执行
+	sf.mu.Lock()
+	delete(sf.m, key)
+	sf.mu.Unlock()
+
+	return c.val, c.err
+}

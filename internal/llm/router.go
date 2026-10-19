@@ -11,6 +11,8 @@ type Router struct {
 	providers map[string]Provider
 	// model → provider 名 的映射表（显式路由）
 	modelIndex map[string]string
+	// provider → 备用 provider 名列表（熔断时自动切换）
+	fallbacks map[string][]string
 }
 
 // NewRouter 新建 router
@@ -18,6 +20,7 @@ func NewRouter() *Router {
 	return &Router{
 		providers:  make(map[string]Provider),
 		modelIndex: make(map[string]string),
+		fallbacks:  make(map[string][]string),
 	}
 }
 
@@ -29,6 +32,20 @@ func (r *Router) Register(p Provider, models ...string) {
 	for _, m := range models {
 		r.modelIndex[m] = p.Name()
 	}
+}
+
+// RegisterFallback 为 provider 声明备用 provider 列表（熔断时自动切换）
+func (r *Router) RegisterFallback(providerName string, fallbacks ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fallbacks[providerName] = fallbacks
+}
+
+// Fallbacks 返回某 provider 的备用列表
+func (r *Router) Fallbacks(providerName string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fallbacks[providerName]
 }
 
 // Pick 根据模型名选 provider
@@ -52,6 +69,14 @@ func (r *Router) Pick(model string) (Provider, error) {
 		return p, nil
 	}
 	return nil, fmt.Errorf("provider not found for model: %s", model)
+}
+
+// PickProvider 按 provider 名直接拿 provider（fallback 切换用）
+func (r *Router) PickProvider(name string) (Provider, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.providers[name]
+	return p, ok
 }
 
 // RegisteredProviders 返回所有已注册的 provider 名

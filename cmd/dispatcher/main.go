@@ -175,14 +175,9 @@ func processTask(
 	recorder *stats.Recorder,
 	retryDelay time.Duration,
 ) {
-	msg := &mq.RequestMessage{
-		RequestID: env.RequestID,
-		UserID:    env.UserID,
-		Model:     env.Model,
-		Req:       env.Req,
-	}
+	msg := env.Msg
 
-	log.Printf("[worker %d] processing request_id=%s model=%s", workerID, msg.RequestID, msg.Model)
+	log.Printf("[worker %d] trace=%s processing request_id=%s model=%s retry=%d", workerID, msg.TraceID, msg.RequestID, msg.Model, msg.RetryCount)
 
 	// 1. 反序列化 LLMRequest
 	var llmReq llm.LLMRequest
@@ -210,6 +205,7 @@ func processTask(
 		metrics.CircuitOpen.Inc()
 		log.Printf("[worker %d] circuit open for %s — retry later", workerID, provider.Name())
 		time.Sleep(retryDelay)
+		// 熔断时不算业务失败，RetryCount 不 +1，直接重新入队等恢复
 		_ = env.NackRequeue()
 		return
 	}
@@ -235,14 +231,20 @@ func processTask(
 	if err != nil {
 		metrics.ProviderFailures.Inc()
 		cb.RecordFailure()
-		log.Printf("[worker %d] provider failed after retries: %v", workerID, err)
+		log.Printf("[worker %d] trace=%s provider failed after retries: %v (retry=%d)", workerID, msg.TraceID, err, msg.RetryCount)
 
-		// 达到重试上限 → 写错误结果 + ack（不再重试）
-		_ = redisCache.SetAsyncResult(ctx, msg.RequestID, map[string]interface{}{
-			"error": err.Error(), "done": true,
-		}, 24*time.Hour)
-		metrics.MQConsumeFail.Inc()
-		_ = env.Ack() // 已写错误状态，ack 避免无限重入
+		// 业务失败：RetryCount++，< 3 重新入队，≥ 3 进死信并写错误结果
+		msg.RetryCount++
+		if msg.RetryCount >= 3 {
+			_ = redisCache.SetAsyncResult(ctx, msg.RequestID, map[string]interface{}{
+				"error": err.Error(), "done": true, "retry_count": msg.RetryCount,
+			}, 24*time.Hour)
+			metrics.MQConsumeFail.Inc()
+			_ = env.NackDead()
+			return
+		}
+		// 未到上限，重新入队（带更新后的 RetryCount）
+		_ = env.NackRequeue()
 		return
 	}
 
@@ -258,7 +260,7 @@ func processTask(
 	_ = recorder.RecordCall(ctx, msg.UserID, msg.Model, resp)
 
 	_ = env.Ack()
-	log.Printf("[worker %d] done request_id=%s latency_ms=%.0f", workerID, msg.RequestID, lat)
+	log.Printf("[worker %d] trace=%s done request_id=%s latency_ms=%.0f", workerID, msg.TraceID, msg.RequestID, lat)
 }
 
 func envInt(key string, fallback int) int {

@@ -36,7 +36,8 @@ type App struct {
 	router  *llm.Router
 	stats   *stats.Recorder
 	mq      *mq.Client
-	cbGroup *resilience.Group // 按 provider 隔离的熔断器
+	cbGroup *resilience.Group   // 按 provider 隔离的熔断器
+	sf      *cache.SingleFlight // 防缓存击穿：同 prompt 并发只调一次 LLM
 }
 
 func main() {
@@ -106,6 +107,7 @@ func main() {
 		stats:   recorder,
 		mq:      mqClient,
 		cbGroup: cbGroup,
+		sf:      cache.NewSingleFlight(),
 	}
 
 	// === Gin 路由 ===
@@ -202,6 +204,8 @@ func (a *App) authMiddleware(c *gin.Context) {
 	}
 	c.Set("user_id", claims.UserID)
 	c.Set("role", claims.Role)
+	// 生成 trace_id 贯穿整条链路（Gateway 日志 → 队列消息 → Dispatcher 日志）
+	c.Set("trace_id", utils.NewRequestID())
 	c.Next()
 }
 
@@ -312,8 +316,8 @@ func (a *App) chatCompletions(c *gin.Context) {
 	providerName := provider.Name()
 	cb := a.cbGroup.Get(providerName)
 
-	// 2. 限流
-	allowed, _ := a.limiter.Allow(ctx, userID.(string))
+	// 2. 限流（按 user_id + model 维度独立桶，避免一个模型用光额度影响其他模型）
+	allowed, _ := a.limiter.Allow(ctx, userID.(string)+":"+raw.Model)
 	if !allowed {
 		metrics.RateLimitRejects.Inc()
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
@@ -340,15 +344,25 @@ func (a *App) chatCompletions(c *gin.Context) {
 		metrics.CacheMisses.Inc()
 	}
 
-	// 4. 熔断器检查
+	// 4. 熔断器检查，若熔断则自动尝试 fallback provider
 	if !cb.Allow() {
 		metrics.CircuitOpen.Inc()
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error":         "provider circuit open, try later",
-			"provider":      providerName,
-			"circuit_state": string(cb.State()),
-		})
-		return
+		// 遍历 fallback 列表，找第一个没熔断的
+		fallbackProvider, fallbackName := a.tryFallback(providerName)
+		if fallbackProvider == nil {
+			// 所有 fallback 都熔断了，返回 503
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":         "provider circuit open, no fallback available",
+				"provider":      providerName,
+				"circuit_state": string(cb.State()),
+			})
+			return
+		}
+		// 切到 fallback provider
+		provider = fallbackProvider
+		providerName = fallbackName
+		cb = a.cbGroup.Get(providerName)
+		log.Printf("[gateway] provider %s circuit open, fallback to %s", providerName, fallbackName)
 	}
 
 	if raw.Stream {
@@ -358,45 +372,72 @@ func (a *App) chatCompletions(c *gin.Context) {
 	}
 }
 
-func (a *App) handleSync(c *gin.Context, p llm.Provider, req *llm.LLMRequest, userID string, cb *resilience.CircuitBreaker) {
-	start := time.Now()
-	metrics.ProviderCalls.Inc()
-
-	// 带重试的 provider 调用（非流式）
-	opt := resilience.DefaultRetryOption()
-	opt.MaxAttempts = 3
-	opt.Retryable = func(err error) bool {
-		// 网络错误/超时/5xx 才重试；4xx 业务错误不重试
-		return err != nil
+// tryFallback 从 provider 的 fallback 列表里找第一个未熔断的 provider
+func (a *App) tryFallback(providerName string) (llm.Provider, string) {
+	for _, fbName := range a.router.Fallbacks(providerName) {
+		fb, ok := a.router.PickProvider(fbName)
+		if !ok {
+			continue
+		}
+		fbCB := a.cbGroup.Get(fbName)
+		if fbCB.Allow() {
+			return fb, fbName
+		}
 	}
+	return nil, ""
+}
 
-	var resp *llm.LLMResponse
-	err := resilience.DoWithRetry(c.Request.Context(), func() error {
-		var e error
-		resp, e = p.Chat(req)
-		return e
-	}, opt)
+func (a *App) handleSync(c *gin.Context, p llm.Provider, req *llm.LLMRequest, userID string, cb *resilience.CircuitBreaker) {
+	// 用 singleflight 合并同 prompt 的并发请求，防止缓存击穿
+	// key = model + md5(reqBody)，同 key 的并发请求只有第一个调 LLM，其余等结果
+	sfKey := cache.CacheKey(req.Model, req)
 
-	lat := metrics.ObserveLatency(start)
-	metrics.ProviderLatency.Observe(lat)
+	result, err := a.sf.Do(sfKey, func() (interface{}, error) {
+		start := time.Now()
+		metrics.ProviderCalls.Inc()
+
+		// 带重试的 provider 调用（非流式）
+		opt := resilience.DefaultRetryOption()
+		opt.MaxAttempts = 3
+		opt.Retryable = func(err error) bool {
+			// 网络错误/超时/5xx 才重试；4xx 业务错误不重试
+			return err != nil
+		}
+
+		var resp *llm.LLMResponse
+		e := resilience.DoWithRetry(c.Request.Context(), func() error {
+			var inner error
+			resp, inner = p.Chat(req)
+			return inner
+		}, opt)
+
+		lat := metrics.ObserveLatency(start)
+		metrics.ProviderLatency.Observe(lat)
+
+		if e != nil {
+			metrics.ProviderFailures.Inc()
+			cb.RecordFailure()
+			return nil, e
+		}
+		cb.RecordSuccess()
+
+		// 写缓存 + 统计（异步）
+		go func() {
+			cacheCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = a.cache.SetLLM(cacheCtx, req.Model, req, resp, time.Duration(a.cfg.CacheTTL)*time.Second)
+			_ = a.stats.RecordCall(cacheCtx, userID, req.Model, resp)
+		}()
+
+		return resp, nil
+	})
 
 	if err != nil {
-		metrics.ProviderFailures.Inc()
-		cb.RecordFailure()
 		c.JSON(http.StatusBadGateway, gin.H{"error": "provider failed after retries: " + err.Error()})
 		return
 	}
-	cb.RecordSuccess()
 
-	// 写缓存 + 统计（异步）
-	go func() {
-		cacheCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = a.cache.SetLLM(cacheCtx, req.Model, req, resp, time.Duration(a.cfg.CacheTTL)*time.Second)
-		_ = a.stats.RecordCall(cacheCtx, userID, req.Model, resp)
-	}()
-
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, result)
 }
 
 func (a *App) handleStream(c *gin.Context, p llm.Provider, req *llm.LLMRequest, userID string, cb *resilience.CircuitBreaker) {
@@ -483,6 +524,7 @@ func (a *App) chatCompletionsAsync(c *gin.Context) {
 	}
 
 	requestID := utils.NewRequestID()
+	traceID, _ := c.Get("trace_id")
 	llmReq := &llm.LLMRequest{
 		Model: raw.Model, Messages: raw.Messages,
 		Temperature: raw.Temperature, MaxTokens: raw.MaxTokens,
@@ -490,6 +532,7 @@ func (a *App) chatCompletionsAsync(c *gin.Context) {
 	reqBytes, _ := json.Marshal(llmReq)
 	msg := &mq.RequestMessage{
 		RequestID: requestID,
+		TraceID:   traceID.(string),
 		UserID:    userID.(string),
 		Model:     raw.Model,
 		Req:       reqBytes,
