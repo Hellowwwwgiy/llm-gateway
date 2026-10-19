@@ -232,7 +232,7 @@ Gateway                     Redis List                 Dispatcher
 
 令牌桶的"补充 + 扣减"必须原子执行，否则高并发下会超发。这里用 Redis Lua 脚本一次 RTT 完成全部逻辑，比 WATCH/MULTI 乐观锁更高效——后者在高并发下会产生大量事务冲突重试。脚本逻辑：从 Hash 读 tokens 和 last，按 `elapsed * qps` 补充令牌（cap 到容量），够用就扣减写回并返回 1，否则返回 0。
 
-限流 key 设计为 `ratelimit:user:{userId}:model:{model}`，每个用户对每个模型拥有独立的令牌桶，避免某个模型流量大时把其他模型的额度一起用光。
+限流 key 设计为 `ratelimit:{userId}:{model}`，每个用户对每个模型拥有独立的令牌桶，避免某个模型流量大时把其他模型的额度一起用光。
 
 ### 6.2 缓存击穿防护：SingleFlight
 
@@ -256,7 +256,7 @@ Gateway 和 Dispatcher 是两个独立进程，日志无法直接关联。Gatewa
 
 ### 6.6 Prometheus 指标设计
 
-全链路共 14 个指标，覆盖 HTTP、Provider、缓存、限流、队列、熔断六类。label 只保留 `provider` 和 `model` 两个维度——绝对不能放 `user_id`，否则每个用户产生独立 time series，基数爆炸。Histogram 用 11 个 bucket（5ms → 10s）覆盖 LLM 调用的延迟范围。Gateway 和 Dispatcher 各自注册独立的 metrics endpoint（8080/8081），Prometheus 按 job 区分。
+全链路共 14 个指标，覆盖 HTTP、Provider、缓存、限流、队列、熔断六类。当前所有指标均无 label——设计上避免加入 user_id 等高基数维度，否则每个用户产生独立 time series 会导致基数爆炸。Histogram 用 11 个 bucket（5ms → 10s）覆盖 LLM 调用的延迟范围。Gateway 和 Dispatcher 各自注册独立的 metrics endpoint（8080/8081），Prometheus 按 job 区分。
 
 ---
 
