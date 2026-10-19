@@ -17,10 +17,10 @@ SmartProxy 是一个 Go + Gin 实现的多模型 LLM API 网关。用户调一�
 | 指标 | 实测值 | 来源 |
 |------|--------|------|
 | 冷启动 LLM 调用 | 700-1000ms | Gin 服务端 handler 内部耗时日志 |
-| 缓存命中 | ~500µs | Gin 服务端日志 |
-| 加速比 | ~1400x | 714ms / 0.5ms |
+| 缓存命中 | ~500-800µs | Gin 服务端日志 |
+| 加速比 | ~1000x | 754ms / 0.8ms |
 | Prometheus 指标 | 14 个 | `metrics.go:226-249`（HELP 行精确计数） |
-| 异步入队 | ~3ms | LPUSH Redis List |
+| 异步入队 | ~1ms | Gin 服务端日志（LPUSH Redis List） |
 | Worker Pool | 8 | `dispatcher/main.go:34` |
 | 单元测试 | 10/10 PASS | `go test ./internal/...` |
 
@@ -45,7 +45,7 @@ SmartProxy 是一个 Go + Gin 实现的多模型 LLM API 网关。用户调一�
 │  → ⑧ Provider.Chat / ChatStream                                      │
 │                                                                      │
 │  异步入口: POST /chat/completions/async                              │
-│  → LPUSH Redis List → 返回 request_id (~3ms)                         │
+│  → LPUSH Redis List → 返回 request_id (~1ms)                         │
 └──────────────────────────────────────────────────────────────────────┘
 └────────────────────┬───────────────────────────────────┬────────────┘
                      │                                   │
@@ -58,9 +58,9 @@ SmartProxy 是一个 Go + Gin 实现的多模型 LLM API 网关。用户调一�
       │                            │      │  ③ 异步结果存储            │
       │  BRPOP → 反序列化          │      │  ④ 主队列 async_chat       │
       │  → 熔断 → 重试             │      │  ⑤ 死信队列 dlq            │
-      │  → Provider.Chat()         │      │                            │
-      │  → SET async_result        │      │                            │
-      └────────────────────────────┘      └────────────────────────────┘
+      │  → Provider.Chat()         │      └────────────────────────────┘
+      │  → SET async_result        │
+      └────────────────────────────┘
                     │
                     ▼
         ┌────────────────────────┐
@@ -91,7 +91,7 @@ Gateway 负责承接 HTTP 流量，Dispatcher 负责异步消息消费，两个�
 | 限流 | **Redis Lua 令牌桶** | — | 原子性脚本，分布式安全 |
 | 熔断 | **自研 resilience** | — | 三态状态机 + 按 provider 隔离 + fallback 自动切换 |
 | 重试 | **自研 resilience** | — | 指数退避（100ms 倍增，cap 2s）+ context 可取消 |
-| 可观测 | **Prometheus** | client_golang | 14 个指标含 Histogram，Gateway + Dispatcher 双端口 |
+| 可观测 | **Prometheus 格式（自研）** | — | 手写 exposition 格式，14 指标含 Histogram，无 client_golang 依赖，Gateway + Dispatcher 双端口 |
 | 容器 | **Docker Compose** | — | 一键拉起 Redis + Gateway + Dispatcher |
 | CI | **GitHub Actions** | — | push 自动 go build + vet + test |
 | 构建 | `-trimpath -ldflags="-s -w"` | — | 去路径去符号表，体积 -30%，减少杀毒误报 |
@@ -169,7 +169,7 @@ POST /api/v1/chat/completions
 ├─ ⑤ Prompt 去重缓存 (cache/cache.go)
 │     key = "llmcache:" + model + ":" + md5(json.Marshal(LLMRequest))
 │     Redis GET → 命中？
-│       YES → cache_hits_total++ → 直接返回  ← 加速 1400x
+│       YES → cache_hits_total++ → 直接返回  ← 加速 ~1000x
 │       NO  → cache_misses_total++ → 继续
 │
 ├─ ⑥ 熔断器检查 (resilience/circuit.go)
@@ -198,7 +198,7 @@ POST /api/v1/chat/completions
 ```
 Gateway                     Redis List                 Dispatcher
  │                          │                          │
- ├──────────────────────────►  LPUSH(msg)  ~3ms
+ ├──────────────────────────►  LPUSH(msg)  ~1ms
  │                          │                          │
  ◄──────────────────────────┤  返回 request_id
  │                          │                          │
